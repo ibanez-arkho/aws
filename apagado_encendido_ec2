@@ -1,0 +1,159 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Lambda para encender/apagar EC2 por tags con EventBridge y verificación de feriados en Chile
+
+Resources:
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: EC2ControlPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:StartInstances
+                  - ec2:StopInstances
+                  - ec2:DescribeInstances
+                Resource: "*"
+
+  EC2ControlLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: ec2-control-by-tag-chile
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaRole.Arn
+      Timeout: 60
+      Environment:
+        Variables:
+          TAG_KEY: BusinessHours
+          TAG_VALUE: "True"
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          import json
+          import urllib.request
+          from datetime import datetime
+
+          def is_holiday_chile():
+              year = datetime.utcnow().year
+              today = datetime.utcnow().strftime("%Y-%m-%d")
+              url = f"https://date.nager.at/api/v3/PublicHolidays/{year}/CL"
+
+              try:
+                  with urllib.request.urlopen(url, timeout=5) as response:
+                      holidays = json.loads(response.read())
+                      for holiday in holidays:
+                          if holiday["date"] == today:
+                              print(f"Hoy es feriado en Chile: {holiday['localName']}")
+                              return True
+              except Exception as e:
+                  print(f"No se pudo consultar API de feriados: {e}")
+
+              return False
+
+          def lambda_handler(event, context):
+              ec2 = boto3.client("ec2")
+              tag_key = os.environ["TAG_KEY"]
+              tag_value = os.environ["TAG_VALUE"]
+              action = event.get("action", "stop")
+
+              if action == "start" and is_holiday_chile():
+                  print("Hoy es feriado en Chile. No se encienden las instancias.")
+                  return
+
+              response = ec2.describe_instances(
+                  Filters=[
+                      {"Name": f"tag:{tag_key}", "Values": [tag_value]},
+                      {"Name": "instance-state-name", "Values": ["running", "stopped"]}
+                  ]
+              )
+
+              instances = [
+                  instance["InstanceId"]
+                  for reservation in response["Reservations"]
+                  for instance in reservation["Instances"]
+              ]
+
+              if not instances:
+                  print("No se encontraron instancias con el tag especificado.")
+                  return
+
+              if action == "start":
+                  ec2.start_instances(InstanceIds=instances)
+                  print(f"Instancias iniciadas: {instances}")
+              elif action == "stop":
+                  ec2.stop_instances(InstanceIds=instances)
+                  print(f"Instancias detenidas: {instances}")
+              else:
+                  print("Acción no válida. Usa 'start' o 'stop'.")
+
+  ########################
+  # EVENTBRIDGE RULES
+  ########################
+
+  # Lunes a Jueves
+  StartRuleMonThu:
+    Type: AWS::Events::Rule
+    Properties:
+      ScheduleExpression: cron(45 12 ? * MON-THU *)
+      Targets:
+        - Arn: !GetAtt EC2ControlLambda.Arn
+          Id: StartMonThu
+          Input: '{"action":"start"}'
+
+  StopRuleMonThu:
+    Type: AWS::Events::Rule
+    Properties:
+      ScheduleExpression: cron(45 21 ? * MON-THU *)
+      Targets:
+        - Arn: !GetAtt EC2ControlLambda.Arn
+          Id: StopMonThu
+          Input: '{"action":"stop"}'
+
+  # Viernes
+  StartRuleFri:
+    Type: AWS::Events::Rule
+    Properties:
+      ScheduleExpression: cron(45 12 ? * FRI *)
+      Targets:
+        - Arn: !GetAtt EC2ControlLambda.Arn
+          Id: StartFri
+          Input: '{"action":"start"}'
+
+  StopRuleFri:
+    Type: AWS::Events::Rule
+    Properties:
+      ScheduleExpression: cron(30 20 ? * FRI *)
+      Targets:
+        - Arn: !GetAtt EC2ControlLambda.Arn
+          Id: StopFri
+          Input: '{"action":"stop"}'
+
+  # Fin de semana (apagado preventivo)
+  StopRuleSatSun:
+    Type: AWS::Events::Rule
+    Properties:
+      ScheduleExpression: cron(0 10 ? * SAT,SUN *)
+      Targets:
+        - Arn: !GetAtt EC2ControlLambda.Arn
+          Id: StopSatSun
+          Input: '{"action":"stop"}'
+
+  PermissionForEventsToInvokeLambda:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref EC2ControlLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com

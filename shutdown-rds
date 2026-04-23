@@ -1,0 +1,115 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Lambda to stop RDS instances and Aurora clusters based on tags
+
+Parameters:
+  TagKey:
+    Type: String
+    Default: AutoShutdown
+    Description: Tag key used to identify RDS resources
+
+  TagValue:
+    Type: String
+    Default: "True"
+    Description: Tag value used to identify RDS resources
+
+  ScheduleExpression:
+    Type: String
+    Default: "cron(0 22 * * ? *)"
+    Description: EventBridge schedule (UTC)
+
+Resources:
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: rds-autoshutdown-lambda-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: RdsStopPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - rds:DescribeDBInstances
+                  - rds:DescribeDBClusters
+                  - rds:StopDBInstance
+                  - rds:StopDBCluster
+                  - rds:ListTagsForResource
+                Resource: "*"
+
+  RdsAutoShutdownLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: rds-auto-shutdown
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Timeout: 120
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          TAG_KEY: !Ref TagKey
+          TAG_VALUE: !Ref TagValue
+      Code:
+        ZipFile: |
+          import boto3, os
+
+          TAG_KEY = os.environ["TAG_KEY"]
+          TAG_VALUE = os.environ["TAG_VALUE"].lower()
+
+          rds = boto3.client("rds")
+
+          def has_required_tag(arn):
+              tags = rds.list_tags_for_resource(ResourceName=arn).get("TagList", [])
+              return any(
+                  tag["Key"] == TAG_KEY and tag["Value"].lower() == TAG_VALUE
+                  for tag in tags
+              )
+
+          def lambda_handler(event, context):
+              stopped = []
+
+              for db in rds.describe_db_instances()["DBInstances"]:
+                  if db["DBInstanceStatus"] == "available" and has_required_tag(db["DBInstanceArn"]):
+                      rds.stop_db_instance(DBInstanceIdentifier=db["DBInstanceIdentifier"])
+                      stopped.append(db["DBInstanceIdentifier"])
+
+              for cluster in rds.describe_db_clusters()["DBClusters"]:
+                  if cluster["Status"] == "available" and has_required_tag(cluster["DBClusterArn"]):
+                      rds.stop_db_cluster(DBClusterIdentifier=cluster["DBClusterIdentifier"])
+                      stopped.append(cluster["DBClusterIdentifier"])
+
+              return {
+                  "status": "completed",
+                  "stopped_resources": stopped
+              }
+
+  ScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: rds-auto-shutdown-schedule
+      ScheduleExpression: !Ref ScheduleExpression
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt RdsAutoShutdownLambda.Arn
+          Id: RdsAutoShutdownLambdaTarget
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref RdsAutoShutdownLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ScheduleRule.Arn
+
+Outputs:
+  LambdaName:
+    Description: Lambda Function Name
+    Value: !Ref RdsAutoShutdownLambda

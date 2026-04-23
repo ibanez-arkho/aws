@@ -1,0 +1,136 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Ejecuta una Lambda cuando un RDS pasa a estado AVAILABLE usando EventBridge RDS Events
+
+Parameters:
+  TagKey:
+    Type: String
+    Default: AutoShutdown
+  TagValue:
+    Type: String
+    Default: "true"
+
+Resources:
+
+  ########################
+  # IAM ROLE FOR LAMBDA
+  ########################
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: rds-on-available-lambda-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: RdsControlPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - rds:DescribeDBInstances
+                  - rds:StopDBInstance
+                  - rds:ModifyDBInstance
+                  - rds:ListTagsForResource
+                Resource: "*"
+
+  ########################
+  # LAMBDA
+  ########################
+
+  RdsOnAvailableLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: rds-on-available-handler
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Timeout: 60
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          TAG_KEY: !Ref TagKey
+          TAG_VALUE: !Ref TagValue
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+
+          rds = boto3.client("rds")
+
+          TAG_KEY = os.environ["TAG_KEY"]
+          TAG_VALUE = os.environ["TAG_VALUE"].lower()
+
+          def has_tag(arn):
+              tags = rds.list_tags_for_resource(ResourceName=arn)["TagList"]
+              return any(
+                  t["Key"] == TAG_KEY and t["Value"].lower() == TAG_VALUE
+                  for t in tags
+              )
+
+          def lambda_handler(event, context):
+              # ARN del RDS viene directo del evento
+              db_arn = event["resources"][0]
+              db_id = db_arn.split(":db:")[1]
+
+              db = rds.describe_db_instances(
+                  DBInstanceIdentifier=db_id
+              )["DBInstances"][0]
+
+              if db["DBInstanceStatus"] != "available":
+                  print(f"Estado actual: {db['DBInstanceStatus']} — no se actúa")
+                  return
+
+              if has_tag(db["DBInstanceArn"]):
+                  # 👉 ACCIÓN PRINCIPAL (modificable)
+                  rds.stop_db_instance(DBInstanceIdentifier=db_id)
+                  print(f"RDS {db_id} detenido al quedar AVAILABLE")
+
+              return {"status": "ok"}
+
+  ########################
+  # EVENTBRIDGE RULE (RDS STATE)
+  ########################
+
+  RdsAvailableRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: rds-available-event
+      Description: Dispara Lambda cuando un RDS pasa a estado AVAILABLE
+      EventPattern:
+        source:
+          - aws.rds
+        detail-type:
+          - RDS DB Instance Event
+        detail:
+          EventCategories:
+            - availability
+          Message:
+            - prefix: "DB instance is now available"
+      Targets:
+        - Arn: !GetAtt RdsOnAvailableLambda.Arn
+          Id: RdsOnAvailableLambdaTarget
+
+  ########################
+  # PERMISSION EVENTBRIDGE → LAMBDA
+  ########################
+
+  AllowEventBridgeInvokeLambda:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref RdsOnAvailableLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt RdsAvailableRule.Arn
+
+Outputs:
+  LambdaName:
+    Value: !Ref RdsOnAvailableLambda
+  EventRuleName:
+    Value: !Ref RdsAvailableRule
