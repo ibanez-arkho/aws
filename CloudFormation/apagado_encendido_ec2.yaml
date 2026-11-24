@@ -1,7 +1,136 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: Lambda para encender/apagar EC2 por tags con EventBridge y verificación de feriados en Chile
+Description: >
+  Lambda para encender/apagar EC2 por tags con EventBridge Scheduler,
+  horarios y dias configurables, zona horaria local y verificacion de feriados en Chile.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: "Configuracion general" }
+        Parameters: [TimeZone, TagKey, TagValue, CheckHolidays]
+      - Label: { default: "Horario 1 (ej. lunes a jueves)" }
+        Parameters: [Schedule1Days, Schedule1StartTime, Schedule1StopTime]
+      - Label: { default: "Horario 2 opcional (ej. viernes)" }
+        Parameters: [Schedule2Enabled, Schedule2Days, Schedule2StartTime, Schedule2StopTime]
+      - Label: { default: "Apagado preventivo opcional (ej. fin de semana)" }
+        Parameters: [PreventiveStopEnabled, PreventiveStopDays, PreventiveStopTime]
+    ParameterLabels:
+      TimeZone: { default: "Zona horaria de los horarios" }
+      TagKey: { default: "Clave del tag" }
+      TagValue: { default: "Valor del tag" }
+      CheckHolidays: { default: "No encender en feriados de Chile?" }
+      Schedule1Days: { default: "Dias" }
+      Schedule1StartTime: { default: "Hora de encendido (HH:MM)" }
+      Schedule1StopTime: { default: "Hora de apagado (HH:MM)" }
+      Schedule2Enabled: { default: "Activar horario 2?" }
+      Schedule2Days: { default: "Dias" }
+      Schedule2StartTime: { default: "Hora de encendido (HH:MM)" }
+      Schedule2StopTime: { default: "Hora de apagado (HH:MM)" }
+      PreventiveStopEnabled: { default: "Activar apagado preventivo?" }
+      PreventiveStopDays: { default: "Dias" }
+      PreventiveStopTime: { default: "Hora de apagado (HH:MM)" }
+
+Parameters:
+  TimeZone:
+    Type: String
+    Default: America/Santiago
+    Description: Zona horaria IANA en la que se interpretan los horarios (ajusta automaticamente horario de verano).
+
+  TagKey:
+    Type: String
+    Default: BusinessHours
+    Description: Clave del tag que identifica las instancias a controlar.
+
+  TagValue:
+    Type: String
+    Default: "True"
+    Description: Valor del tag que identifica las instancias a controlar.
+
+  CheckHolidays:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Si es true, no se encienden las instancias los dias feriados en Chile.
+
+  # ---------- Horario 1 ----------
+  Schedule1Days:
+    Type: String
+    Default: MON-THU
+    AllowedPattern: ^(MON|TUE|WED|THU|FRI|SAT|SUN)([-,](MON|TUE|WED|THU|FRI|SAT|SUN))*$
+    ConstraintDescription: "Usa dias en ingles: rango (MON-FRI) o lista (MON,WED,FRI)."
+    Description: "Dias de ejecucion. Ej: MON-FRI, MON-THU, MON,WED,FRI"
+
+  Schedule1StartTime:
+    Type: String
+    Default: "09:45"
+    AllowedPattern: ^([01][0-9]|2[0-3]):[0-5][0-9]$
+    ConstraintDescription: Formato HH:MM en 24 horas (ej. 08:30).
+    Description: Hora de encendido (HH:MM, 24 h, en la zona horaria indicada).
+
+  Schedule1StopTime:
+    Type: String
+    Default: "18:45"
+    AllowedPattern: ^([01][0-9]|2[0-3]):[0-5][0-9]$
+    ConstraintDescription: Formato HH:MM en 24 horas (ej. 19:00).
+    Description: Hora de apagado (HH:MM, 24 h, en la zona horaria indicada).
+
+  # ---------- Horario 2 (opcional) ----------
+  Schedule2Enabled:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Activa un segundo horario (util cuando un dia tiene otro horario, ej. viernes).
+
+  Schedule2Days:
+    Type: String
+    Default: FRI
+    AllowedPattern: ^(MON|TUE|WED|THU|FRI|SAT|SUN)([-,](MON|TUE|WED|THU|FRI|SAT|SUN))*$
+    ConstraintDescription: "Usa dias en ingles: rango (MON-FRI) o lista (MON,WED,FRI)."
+    Description: Dias de ejecucion del horario 2.
+
+  Schedule2StartTime:
+    Type: String
+    Default: "09:45"
+    AllowedPattern: ^([01][0-9]|2[0-3]):[0-5][0-9]$
+    ConstraintDescription: Formato HH:MM en 24 horas.
+    Description: Hora de encendido del horario 2 (HH:MM).
+
+  Schedule2StopTime:
+    Type: String
+    Default: "17:30"
+    AllowedPattern: ^([01][0-9]|2[0-3]):[0-5][0-9]$
+    ConstraintDescription: Formato HH:MM en 24 horas.
+    Description: Hora de apagado del horario 2 (HH:MM).
+
+  # ---------- Apagado preventivo (opcional) ----------
+  PreventiveStopEnabled:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Activa un apagado preventivo (ej. por si alguien encendio algo el fin de semana).
+
+  PreventiveStopDays:
+    Type: String
+    Default: SAT,SUN
+    AllowedPattern: ^(MON|TUE|WED|THU|FRI|SAT|SUN)([-,](MON|TUE|WED|THU|FRI|SAT|SUN))*$
+    ConstraintDescription: "Usa dias en ingles: rango (SAT-SUN) o lista (SAT,SUN)."
+    Description: Dias del apagado preventivo.
+
+  PreventiveStopTime:
+    Type: String
+    Default: "07:00"
+    AllowedPattern: ^([01][0-9]|2[0-3]):[0-5][0-9]$
+    ConstraintDescription: Formato HH:MM en 24 horas.
+    Description: Hora del apagado preventivo (HH:MM).
+
+Conditions:
+  IsSchedule2Enabled: !Equals [!Ref Schedule2Enabled, "true"]
+  IsPreventiveStopEnabled: !Equals [!Ref PreventiveStopEnabled, "true"]
 
 Resources:
+  ########################
+  # IAM
+  ########################
   LambdaRole:
     Type: AWS::IAM::Role
     Properties:
@@ -26,6 +155,31 @@ Resources:
                   - ec2:DescribeInstances
                 Resource: "*"
 
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: InvokeEC2ControlLambda
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt EC2ControlLambda.Arn
+
+  ########################
+  # LAMBDA
+  ########################
   EC2ControlLambda:
     Type: AWS::Lambda::Function
     Properties:
@@ -36,26 +190,38 @@ Resources:
       Timeout: 60
       Environment:
         Variables:
-          TAG_KEY: BusinessHours
-          TAG_VALUE: "True"
+          TAG_KEY: !Ref TagKey
+          TAG_VALUE: !Ref TagValue
+          LOCAL_TIMEZONE: !Ref TimeZone
+          CHECK_HOLIDAYS: !Ref CheckHolidays
       Code:
         ZipFile: |
           import boto3
           import os
           import json
           import urllib.request
-          from datetime import datetime
+          from datetime import datetime, timezone, timedelta
+
+          def local_today():
+              """Fecha local segun LOCAL_TIMEZONE (evita errores de fecha por usar UTC)."""
+              tz_name = os.environ.get("LOCAL_TIMEZONE", "America/Santiago")
+              try:
+                  from zoneinfo import ZoneInfo
+                  return datetime.now(ZoneInfo(tz_name)).date()
+              except Exception as e:
+                  print(f"No se pudo cargar la zona horaria {tz_name} ({e}); se usa UTC-3.")
+                  return datetime.now(timezone(timedelta(hours=-3))).date()
 
           def is_holiday_chile():
-              year = datetime.utcnow().year
-              today = datetime.utcnow().strftime("%Y-%m-%d")
-              url = f"https://date.nager.at/api/v3/PublicHolidays/{year}/CL"
+              today = local_today()
+              url = f"https://date.nager.at/api/v3/PublicHolidays/{today.year}/CL"
 
               try:
                   with urllib.request.urlopen(url, timeout=5) as response:
                       holidays = json.loads(response.read())
                       for holiday in holidays:
-                          if holiday["date"] == today:
+                          # Solo feriados nacionales (counties == None); se ignoran los regionales
+                          if holiday["date"] == today.isoformat() and not holiday.get("counties"):
                               print(f"Hoy es feriado en Chile: {holiday['localName']}")
                               return True
               except Exception as e:
@@ -63,97 +229,148 @@ Resources:
 
               return False
 
+          def get_instances(ec2, tag_key, tag_value, states):
+              instances = []
+              paginator = ec2.get_paginator("describe_instances")
+              for page in paginator.paginate(
+                  Filters=[
+                      {"Name": f"tag:{tag_key}", "Values": [tag_value]},
+                      {"Name": "instance-state-name", "Values": states},
+                  ]
+              ):
+                  for reservation in page["Reservations"]:
+                      for instance in reservation["Instances"]:
+                          instances.append(instance["InstanceId"])
+              return instances
+
           def lambda_handler(event, context):
               ec2 = boto3.client("ec2")
               tag_key = os.environ["TAG_KEY"]
               tag_value = os.environ["TAG_VALUE"]
+              check_holidays = os.environ.get("CHECK_HOLIDAYS", "true").lower() == "true"
               action = event.get("action", "stop")
 
-              if action == "start" and is_holiday_chile():
+              if action not in ("start", "stop"):
+                  print("Accion no valida. Usa 'start' o 'stop'.")
+                  return
+
+              if action == "start" and check_holidays and is_holiday_chile():
                   print("Hoy es feriado en Chile. No se encienden las instancias.")
                   return
 
-              response = ec2.describe_instances(
-                  Filters=[
-                      {"Name": f"tag:{tag_key}", "Values": [tag_value]},
-                      {"Name": "instance-state-name", "Values": ["running", "stopped"]}
-                  ]
-              )
-
-              instances = [
-                  instance["InstanceId"]
-                  for reservation in response["Reservations"]
-                  for instance in reservation["Instances"]
-              ]
+              # Solo se actua sobre las instancias que lo necesitan
+              states = ["stopped"] if action == "start" else ["running", "pending"]
+              instances = get_instances(ec2, tag_key, tag_value, states)
 
               if not instances:
-                  print("No se encontraron instancias con el tag especificado.")
+                  print(f"No hay instancias con {tag_key}={tag_value} para '{action}'.")
                   return
 
               if action == "start":
                   ec2.start_instances(InstanceIds=instances)
                   print(f"Instancias iniciadas: {instances}")
-              elif action == "stop":
+              else:
                   ec2.stop_instances(InstanceIds=instances)
                   print(f"Instancias detenidas: {instances}")
-              else:
-                  print("Acción no válida. Usa 'start' o 'stop'.")
 
   ########################
-  # EVENTBRIDGE RULES
+  # EVENTBRIDGE SCHEDULER
+  # (usa la zona horaria indicada, por lo que el cambio de horario
+  #  de verano se ajusta solo)
   ########################
 
-  # Lunes a Jueves
-  StartRuleMonThu:
-    Type: AWS::Events::Rule
+  # Horario 1
+  StartSchedule1:
+    Type: AWS::Scheduler::Schedule
     Properties:
-      ScheduleExpression: cron(45 12 ? * MON-THU *)
-      Targets:
-        - Arn: !GetAtt EC2ControlLambda.Arn
-          Id: StartMonThu
-          Input: '{"action":"start"}'
+      Description: !Sub "Encendido EC2 ${Schedule1Days} a las ${Schedule1StartTime} (${TimeZone})"
+      ScheduleExpression: !Sub
+        - "cron(${Minute} ${Hour} ? * ${Schedule1Days} *)"
+        - Hour: !Select [0, !Split [":", !Ref Schedule1StartTime]]
+          Minute: !Select [1, !Split [":", !Ref Schedule1StartTime]]
+      ScheduleExpressionTimezone: !Ref TimeZone
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      State: ENABLED
+      Target:
+        Arn: !GetAtt EC2ControlLambda.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: '{"action":"start"}'
 
-  StopRuleMonThu:
-    Type: AWS::Events::Rule
+  StopSchedule1:
+    Type: AWS::Scheduler::Schedule
     Properties:
-      ScheduleExpression: cron(45 21 ? * MON-THU *)
-      Targets:
-        - Arn: !GetAtt EC2ControlLambda.Arn
-          Id: StopMonThu
-          Input: '{"action":"stop"}'
+      Description: !Sub "Apagado EC2 ${Schedule1Days} a las ${Schedule1StopTime} (${TimeZone})"
+      ScheduleExpression: !Sub
+        - "cron(${Minute} ${Hour} ? * ${Schedule1Days} *)"
+        - Hour: !Select [0, !Split [":", !Ref Schedule1StopTime]]
+          Minute: !Select [1, !Split [":", !Ref Schedule1StopTime]]
+      ScheduleExpressionTimezone: !Ref TimeZone
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      State: ENABLED
+      Target:
+        Arn: !GetAtt EC2ControlLambda.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: '{"action":"stop"}'
 
-  # Viernes
-  StartRuleFri:
-    Type: AWS::Events::Rule
+  # Horario 2 (opcional)
+  StartSchedule2:
+    Type: AWS::Scheduler::Schedule
+    Condition: IsSchedule2Enabled
     Properties:
-      ScheduleExpression: cron(45 12 ? * FRI *)
-      Targets:
-        - Arn: !GetAtt EC2ControlLambda.Arn
-          Id: StartFri
-          Input: '{"action":"start"}'
+      Description: !Sub "Encendido EC2 ${Schedule2Days} a las ${Schedule2StartTime} (${TimeZone})"
+      ScheduleExpression: !Sub
+        - "cron(${Minute} ${Hour} ? * ${Schedule2Days} *)"
+        - Hour: !Select [0, !Split [":", !Ref Schedule2StartTime]]
+          Minute: !Select [1, !Split [":", !Ref Schedule2StartTime]]
+      ScheduleExpressionTimezone: !Ref TimeZone
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      State: ENABLED
+      Target:
+        Arn: !GetAtt EC2ControlLambda.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: '{"action":"start"}'
 
-  StopRuleFri:
-    Type: AWS::Events::Rule
+  StopSchedule2:
+    Type: AWS::Scheduler::Schedule
+    Condition: IsSchedule2Enabled
     Properties:
-      ScheduleExpression: cron(30 20 ? * FRI *)
-      Targets:
-        - Arn: !GetAtt EC2ControlLambda.Arn
-          Id: StopFri
-          Input: '{"action":"stop"}'
+      Description: !Sub "Apagado EC2 ${Schedule2Days} a las ${Schedule2StopTime} (${TimeZone})"
+      ScheduleExpression: !Sub
+        - "cron(${Minute} ${Hour} ? * ${Schedule2Days} *)"
+        - Hour: !Select [0, !Split [":", !Ref Schedule2StopTime]]
+          Minute: !Select [1, !Split [":", !Ref Schedule2StopTime]]
+      ScheduleExpressionTimezone: !Ref TimeZone
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      State: ENABLED
+      Target:
+        Arn: !GetAtt EC2ControlLambda.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: '{"action":"stop"}'
 
-  # Fin de semana (apagado preventivo)
-  StopRuleSatSun:
-    Type: AWS::Events::Rule
+  # Apagado preventivo (opcional)
+  PreventiveStopSchedule:
+    Type: AWS::Scheduler::Schedule
+    Condition: IsPreventiveStopEnabled
     Properties:
-      ScheduleExpression: cron(0 10 ? * SAT,SUN *)
-      Targets:
-        - Arn: !GetAtt EC2ControlLambda.Arn
-          Id: StopSatSun
-          Input: '{"action":"stop"}'
+      Description: !Sub "Apagado preventivo EC2 ${PreventiveStopDays} a las ${PreventiveStopTime} (${TimeZone})"
+      ScheduleExpression: !Sub
+        - "cron(${Minute} ${Hour} ? * ${PreventiveStopDays} *)"
+        - Hour: !Select [0, !Split [":", !Ref PreventiveStopTime]]
+          Minute: !Select [1, !Split [":", !Ref PreventiveStopTime]]
+      ScheduleExpressionTimezone: !Ref TimeZone
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      State: ENABLED
+      Target:
+        Arn: !GetAtt EC2ControlLambda.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: '{"action":"stop"}'
 
-  PermissionForEventsToInvokeLambda:
-    Type: AWS::Lambda::Permission
-    Properties:
-      FunctionName: !Ref EC2ControlLambda
-      Action: lambda:InvokeFunction
-      Principal: events.amazonaws.com
+Outputs:
+  LambdaArn:
+    Description: ARN de la Lambda de control
+    Value: !GetAtt EC2ControlLambda.Arn
